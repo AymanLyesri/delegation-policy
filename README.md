@@ -5,6 +5,10 @@ main agent's instructions, so the cheap orchestrator model (DeepSeek Flash)
 routes work instead of doing it: planning and review always go to GLM
 one-shot subagents, task execution to DeepSeek subagents.
 
+Since v2.0.0 the policy is also ENFORCED by a `pre_tool_call` hook. Prose in
+a prompt was not enough: the orchestrator kept reading the plan/review skills
+and writing plans itself. See "## The gate" below.
+
 The plugin does ONLY this. It is not an orchestration engine: Hermes' native
 `delegate_task` already exists, and `delegation.model` / `delegation.provider`
 in `config.yaml` already select the worker model. Nothing here touches model
@@ -14,11 +18,54 @@ routing, tools, or core code.
 
 ```
 delegation-policy/
-+-- plugin.yaml     manifest (name, version, description)
-+-- __init__.py     register(ctx): one system-prompt-section registration
++-- plugin.yaml     manifest (name, version, description, provides_hooks)
++-- __init__.py     register(ctx): one system-prompt-section + the pre_tool_call gate
 +-- policy.md       the policy text - the part you edit
 +-- README.md       this file
 ```
+
+## The gate
+
+The hook is the part that actually bites. Blocked, on a gated session:
+
+| tool | condition |
+|---|---|
+| `skill_view` | name is `plan`, `writing-plans` or `requesting-code-review` (any namespace prefix) |
+| `read_file` | path is `<...>/skills/<that skill>/SKILL.md` - without this, the documented "read the SKILL.md directly" fallback routes around the block |
+| `write_file`, `patch` | path contains `.hermes/plans/` |
+| `terminal` | command contains `.hermes/plans/` AND a write verb (redirect, tee, cp, mv, sed -i, rm) |
+
+The block message names the exact command to run. Unlock rule: a row in
+`$HERMES_HOME/state.db` with `sessions.source='oneshot'`, `model like 'glm%'`,
+`started_at` AFTER this session's last block for the same act, and newer than
+15 minutes. Evidence is the recorded run, never the command string, so `echo`
+or a failed spawn unlocks nothing, and planning and review buy separate
+passes. A first gated call in a session always blocks once (it arms the
+anchor).
+
+Scoping: `pre_tool_call` hooks get no `platform`, so the gate reads
+`sessions.source` itself. `subagent` (delegate_task workers), `oneshot` (the
+GLM pass and any `hermes chat -q`) and `cron` are exempt; everything else is
+gated. A missing row or a failing lookup fails OPEN and writes an error line,
+so a broken store can never wedge a turn.
+
+Ledger: every decision appends one line to
+`$HERMES_HOME/logs/delegation-policy-gate.jsonl` (`block`, `allow` with the
+evidence timestamp, or `error`). Nothing else is logged.
+
+Known holes, by design or by limit of the mechanism:
+
+- Prose. A plan written into the chat is invisible to a hook.
+- `execute_code` and any tool that writes files without a `path` arg.
+- A DeepSeek `delegate_task` child is exempt and can write a plan.
+- Evidence is global, not per session: a GLM pass in another window counts.
+- A gateway restart clears the anchors; every session then blocks once more
+  (the safe direction).
+
+Proof, in order, from a live session: `block` in the ledger for the local
+session -> a `glm-5.3` oneshot row appears -> the retried call logs `allow`
+with `evidence` equal to that row's `started_at` -> a review-skill call still
+blocks -> no `error` lines anywhere between.
 
 The intended model split (already configured in `config.yaml`, not by this
 plugin):
@@ -93,8 +140,7 @@ ctx.register_system_prompt_section(
   framed as `## Plugin Context: delegation-policy` inside an HTML-comment
   container. It is then FROZEN on the agent for the whole session, persisted
   with the prompt verbatim, and restored from the persisted bytes on resume.
-  There is no per-turn hook, no repeated injection, nothing that runs during
-  the conversation.
+  The text is never re-injected; the hook (below) is what runs per tool call.
 - Verification trail: each render logs one line, once per session -
   `grep "Session plugin prompt section" ~/.hermes/logs/agent.log`.
 - Scoped delivery: the render callback checks the session's platform. Workers
@@ -116,16 +162,33 @@ ctx.register_system_prompt_section(
 Measured on the installed build (framing computed with Hermes' own
 `format_system_prompt_sections`):
 
-- Policy text: 2257 chars (2257 bytes on disk).
-- Total prompt bytes added: 2257 + 80 section frame + 74 container markers,
+- Policy text: 2844 chars (2844 bytes on disk, measured 2026-11-19).
+- Total prompt bytes added: 2844 + 80 section frame + 74 container markers,
   ONCE per session, not per turn.
-- Roughly 450 tokens per session at ~4 chars/token for English prose -
+- Roughly 710 tokens per session at ~4 chars/token for English prose -
   the fixed cost of the policy, paid once when the session's prompt is
   built and then covered by prompt caching.
+- The gate adds nothing to the prompt. A block message (~4 lines) enters the
+  transcript only on a blocked call, and the retried call replaces nothing.
 - Aggregate budget: Hermes allows up to 8000 chars across all plugin
   sections; this plugin uses 1795 of it.
 
 ## Troubleshooting
+
+- A planning/review call blocked in a session that should be exempt: check
+  `sessions.source` for that session id in `state.db`. Only `subagent`,
+  `oneshot` and `cron` are exempt; a row written by some other surface is
+  gated on purpose.
+- The gate never blocks anything: `grep '"event": "block"'`
+  `$HERMES_HOME/logs/delegation-policy-gate.jsonl`. No lines at all means the
+  hook did not load (check `hermes plugins list` for an error) or every call
+  was exempt.
+- The gate blocks after a GLM pass: the pass must be NEWER than the block
+  (`evidence` in the `allow` line) and its session row must read
+  `source='oneshot'`, `model like 'glm%'`. A `hermes chat` run on another
+  model is not evidence.
+- `error` lines in the ledger: the gate failed open. The reason is in the
+  line; the turn was not blocked.
 
 - "Not enabled" in `hermes plugins list` after enabling: run
   `hermes plugins list` again; if it shows an error, the load failed - the

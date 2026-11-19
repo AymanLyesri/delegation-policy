@@ -26,6 +26,17 @@ review subagents, on compact briefs.
 - One GLM planning pass before substantial work, one GLM review pass after
   it. Batch related questions into a single brief instead of stacking calls.
 
+### Gate (enforced by a hook)
+
+Reading the plan or review skills, and writing under ~/.hermes/plans/, is
+blocked until a GLM pass has run in this session. A blocked call returns the
+command to run: write the brief to ~/.hermes/cache/scratch/glm-brief.md, run
+`hermes chat -q "$(cat ~/.hermes/cache/scratch/glm-brief.md)" -m glm-5.3
+--provider opencode-go`, then retry the blocked call. One GLM pass buys 15
+minutes, then the gate asks again. The gate reads state.db, not your prose:
+planning written into the chat is invisible to it, so do not route around it
+in text - spawn the pass.
+
 ### Orchestration
 - Give every worker clear objectives, constraints, relevant context, and
   completion criteria; let workers make routine implementation decisions.
