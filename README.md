@@ -42,6 +42,12 @@ The hook is the part that actually bites. Blocked, on a gated session:
 | `write_file`, `patch` | path contains `.hermes/plans/` |
 | `terminal` | command contains `.hermes/plans/` AND a write verb (redirect, tee, cp, mv, sed -i, rm) |
 
+Heavy thinking is deliberately NOT in this table: it has no tool signature, so
+the hook cannot see it. That lane is audited after the fact instead - a
+DeepSeek fix reworked because its diagnosis was wrong escalates the
+re-diagnosis to GLM. Any GLM one-shot unlocks the gate, including a
+heavy-thinking pass, so a thinking pass still owes its own planning brief.
+
 The block message names the exact command to run. Unlock rule: a row in
 `$HERMES_HOME/state.db` with `sessions.source='oneshot'`, `model like 'glm%'`,
 `started_at` AFTER this session's last block for the same act, and newer than
@@ -169,17 +175,18 @@ ctx.register_system_prompt_section(
 Measured on the installed build (framing computed with Hermes' own
 `format_system_prompt_sections`):
 
-- Policy text: 3995 chars (3995 bytes on disk, measured 2026-11-20, at the
-  4000-char section ceiling).
-- Total prompt bytes added: 3995 + 80 section frame + 74 container markers,
+- Policy text: 3914 chars (3914 bytes on disk, measured 2026-11-20), 86 under
+  the 4000-char hard ceiling.
+- Total prompt bytes added: 3914 + 80 section frame + 74 container markers,
   ONCE per session, not per turn.
-- Roughly 1000 tokens per session at ~4 chars/token for English prose -
+- Roughly 1000 tokens per session at ~4 chars/token; nearer 1200-1300 if the
+  paths and flags in it tokenize tighter than prose -
   the fixed cost of the policy, paid once when the session's prompt is
   built and then covered by prompt caching.
 - The gate adds nothing to the prompt. A block message (~4 lines) enters the
   transcript only on a blocked call, and the retried call replaces nothing.
 - Aggregate budget: Hermes allows up to 8000 chars across all plugin
-  sections; this plugin's section is 4149 of it.
+  sections content; this section is 3914 of it (4068 bytes on the wire).
 
 ## Troubleshooting
 
