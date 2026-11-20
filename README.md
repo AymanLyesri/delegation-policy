@@ -2,8 +2,15 @@
 
 A standalone Hermes plugin that keeps a delegation policy permanently in the
 main agent's instructions, so the cheap orchestrator model (DeepSeek Flash)
-routes work instead of doing it: planning and review always go to GLM
-one-shot subagents, task execution to DeepSeek subagents.
+routes work instead of doing it: planning, review and heavy thinking always go
+to GLM one-shot subagents, task execution to DeepSeek subagents.
+
+"Planning" and "review" have exact tool signatures, so a hook can enforce them.
+"Heavy thinking" - the questions with no mechanical oracle, where a cheap model
+produces a confident wrong answer - has none, so that lane is voluntary and
+policed after the fact by rework: a DeepSeek fix that got reworked escalates to
+GLM. The one-glance rule for the lane: if a worker could falsify its own answer
+by running a command, it is execution, not thinking.
 
 Since v2.0.0 the policy is also ENFORCED by a `pre_tool_call` hook. Prose in
 a prompt was not enough: the orchestrator kept reading the plan/review skills
@@ -162,16 +169,17 @@ ctx.register_system_prompt_section(
 Measured on the installed build (framing computed with Hermes' own
 `format_system_prompt_sections`):
 
-- Policy text: 2844 chars (2844 bytes on disk, measured 2026-11-19).
-- Total prompt bytes added: 2844 + 80 section frame + 74 container markers,
+- Policy text: 3995 chars (3995 bytes on disk, measured 2026-11-20, at the
+  4000-char section ceiling).
+- Total prompt bytes added: 3995 + 80 section frame + 74 container markers,
   ONCE per session, not per turn.
-- Roughly 710 tokens per session at ~4 chars/token for English prose -
+- Roughly 1000 tokens per session at ~4 chars/token for English prose -
   the fixed cost of the policy, paid once when the session's prompt is
   built and then covered by prompt caching.
 - The gate adds nothing to the prompt. A block message (~4 lines) enters the
   transcript only on a blocked call, and the retried call replaces nothing.
 - Aggregate budget: Hermes allows up to 8000 chars across all plugin
-  sections; this plugin uses 1795 of it.
+  sections; this plugin's section is 4149 of it.
 
 ## Troubleshooting
 

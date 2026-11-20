@@ -1,6 +1,6 @@
 name: delegation-policy
-version: 2.0.0
-description: "Delegation policy for the main agent: orchestrator runs DeepSeek Flash; planning and review always run in a GLM one-shot subagent, task execution in DeepSeek subagents. The policy text lives in policy.md; a pre_tool_call hook enforces it by blocking the plan/review entry points until a GLM pass exists. Model routing is not changed."
+version: 2.1.0
+description: "Delegation policy for the main agent: orchestrator runs DeepSeek Flash; planning, review and heavy thinking run in GLM one-shot subagents, task execution in DeepSeek subagents. The policy text lives in policy.md; a pre_tool_call hook enforces the plan/review entry points by blocking them until a GLM pass exists. The heavy-thinking lane is voluntary (it has no tool signature) and escalates on rework. Model routing is not changed."
 author: "Ayman"
 license: MIT
 provides_hooks:
