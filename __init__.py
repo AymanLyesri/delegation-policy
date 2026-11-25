@@ -11,7 +11,7 @@ Two parts, both in this file:
 2. THE GATE (pre_tool_call hook). Prose in a prompt was not enough: the
    orchestrator kept doing planning and review inline. The hook blocks the
    mechanical entry points for those two activities on the orchestrator
-   session and hands back the exact command to spawn a GLM pass:
+   session and hands back the exact command to spawn a planner pass:
 
    - skill_view of a planning or review skill (plan, writing-plans,
      requesting-code-review), and read_file of that skill's SKILL.md
@@ -19,14 +19,15 @@ Two parts, both in this file:
      "read the SKILL.md directly" fallback).
    - write_file / patch of an artifact under .hermes/plans/.
 
-   Unlock: a session gets through only once a real GLM pass exists in
-   state.db - a sessions row with source='oneshot', model starting 'glm',
-   started_at newer than this session's last block and newer than
-   UNLOCK_TTL_SECONDS. Evidence is the recorded run, never the command
-   string, so an echo or a failed spawn does not unlock anything.
+   Unlock: a session gets through only once a real planner pass exists in
+   state.db - a sessions row with source='oneshot', model starting with one
+   of the configured planner/reviewer models, started_at newer than this
+   session's last block and newer than UNLOCK_TTL_SECONDS. Evidence is the
+   recorded run, never the command string, so an echo or a failed spawn does
+   not unlock anything.
 
    Scope: any session whose sessions.source is not in EXEMPT_SOURCES.
-   'subagent' (delegate_task workers) and 'oneshot' (the GLM pass itself,
+   'subagent' (delegate_task workers) and 'oneshot' (the planner pass itself,
    and hermes chat -q runs) and 'cron' are left alone. A missing row means
    fail open: the gate never breaks a turn.
 
@@ -39,8 +40,20 @@ normally without the section). If the file becomes unreadable later, the
 section renders a short notice line instead - the failure is visible in the
 prompt itself, not only in the logs.
 
-Model routing is NOT touched here: delegation.model / delegation.provider in
-config.yaml stay the single owner of which model workers run on.
+Model routing is NOT hardcoded here. config.yaml is the single owner, and the
+policy text plus the gate's command are rendered from it once per new session:
+
+  delegation:
+    model: <worker model>          # delegate_task children
+    provider: <worker provider>
+    roles:
+      planner:  {model: glm-5.3, provider: opencode-go}
+      reviewer: {model: glm-5.3, provider: opencode-go}
+
+The orchestrator row is read from the live session (session-info model and
+provider) with model.default as the fallback: the plugin cannot route the model
+that is already answering, so it does not pretend to. Missing keys fall back to
+DEFAULT_ROLES, which reproduces the historical behaviour exactly.
 """
 
 from __future__ import annotations
@@ -93,11 +106,35 @@ PLANS_MARKER = ".hermes/plans/"
 # children (including the GLM pass itself), and bounded cron runs.
 EXEMPT_SOURCES = frozenset({"subagent", "cron", "oneshot"})
 
-# A GLM pass is evidence for this long; then the gate asks for a fresh one.
+# A planner pass is evidence for this long; then the gate asks for a fresh one.
 UNLOCK_TTL_SECONDS = 15 * 60
 
-# Model family that counts as the planning/review pass.
-UNLOCK_MODEL_PREFIX = "glm"
+# --- role routing (the models are settings, never constants) --------------
+#
+# Precedence, per role: delegation.roles.<role>.{model,provider} -> the
+# historical default. The reviewer inherits the planner's pair when unset, and
+# the worker falls back to the orchestrator's model (children inherit the
+# parent when delegation.model is unset). The orchestrator is the live session,
+# so it is resolved per session in _roles(info).
+DEFAULT_ROLES = {
+    "planner": {"model": "glm-5.3", "provider": "opencode-go"},
+    "reviewer": {"model": "glm-5.3", "provider": "opencode-go"},
+}
+
+# Older session rows recorded the bare model family; accept it while the
+# configured planner still belongs to that family.
+LEGACY_UNLOCK_PREFIX = "glm"
+
+# Pins the config for the self-test (and any probe); None means "read the live
+# one through the host loader".
+_CONFIG_OVERRIDE: dict | None = None
+
+# Model names the policy text is rendered with; each must appear in policy.md.
+POLICY_TOKENS = (
+    "{{ORCH}}", "{{ORCH_P}}",
+    "{{PLAN}}", "{{PLAN_P}}",
+    "{{WORK}}", "{{WORK_P}}",
+)
 
 # Where the gate tells the orchestrator to write its brief. Must NOT be under
 # PLANS_MARKER, or the agent gets blocked while writing the thing it was just
@@ -144,6 +181,113 @@ def _query(sql: str, params: tuple = ()) -> list[tuple]:
             con.close()
 
 
+def _parse_yaml(text: str):
+    """Parse YAML with the host's vendored loader, then PyYAML, then fail."""
+    errors = []
+    for module in ("hermes_yaml", "yaml"):
+        try:
+            loader = __import__(module, fromlist=["safe_load"])
+            return loader.safe_load(text)
+        except Exception as exc:  # noqa: BLE001 - try the next loader
+            errors.append(f"{module}: {exc!r}")
+    raise RuntimeError("no usable YAML loader (" + "; ".join(errors) + ")")
+
+
+def _config() -> dict:
+    """Effective config as a dict; {} only when every source fails.
+
+    The host's own loader comes first, and it is not a nicety: PyYAML is NOT
+    importable in the process that renders prompt sections (measured:
+    ModuleNotFoundError 'yaml'), while hermes_cli.config always is - and it
+    returns the merged view the runtime actually reads. The file parsers after
+    it exist for the self-test and for builds whose layout differs.
+    """
+    if _CONFIG_OVERRIDE is not None:
+        return _CONFIG_OVERRIDE
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+        if isinstance(cfg, dict):
+            return cfg
+    except Exception as exc:  # noqa: BLE001 - fall through to the file
+        logger.debug("delegation-policy: host config loader unavailable: %s", exc)
+    path = _hermes_home() / "config.yaml"
+    if not path.is_file():
+        logger.warning("delegation-policy: config missing at %s, using defaults", path)
+        return {}
+    try:
+        data = _parse_yaml(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning(
+            "delegation-policy: config unreadable at %s (%r), using defaults", path, exc
+        )
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _as_pair(entry, model, provider) -> dict[str, str]:
+    """{model, provider} from one config entry, gaps filled from the fallbacks."""
+    entry = entry if isinstance(entry, dict) else {}
+    return {
+        "model": str(entry.get("model") or model or ""),
+        "provider": str(entry.get("provider") or provider or ""),
+    }
+
+
+def _roles(info=None) -> dict[str, dict[str, str]]:
+    """Resolve orchestrator/planner/reviewer/worker from config.yaml; no raise."""
+    cfg = _config()
+    cfg = cfg if isinstance(cfg, dict) else {}
+    info = info if isinstance(info, dict) else {}
+    delegation = cfg.get("delegation")
+    delegation = delegation if isinstance(delegation, dict) else {}
+    configured = delegation.get("roles")
+    configured = configured if isinstance(configured, dict) else {}
+    main = cfg.get("model")
+    main = main if isinstance(main, dict) else {}
+
+    orchestrator = {
+        "model": str(info.get("model") or main.get("default") or ""),
+        "provider": str(info.get("provider") or main.get("provider") or ""),
+    }
+    planner = _as_pair(
+        configured.get("planner"),
+        DEFAULT_ROLES["planner"]["model"],
+        DEFAULT_ROLES["planner"]["provider"],
+    )
+    reviewer = _as_pair(
+        configured.get("reviewer"), planner["model"], planner["provider"]
+    )
+    # A worker with no delegation.model inherits the orchestrator's model.
+    worker = _as_pair(
+        configured.get("worker"),
+        delegation.get("model") or orchestrator["model"],
+        delegation.get("provider") or orchestrator["provider"],
+    )
+    return {
+        "orchestrator": orchestrator,
+        "planner": planner,
+        "reviewer": reviewer,
+        "worker": worker,
+    }
+
+
+def _render(template: str, roles: dict) -> str:
+    """Substitute the role tokens; an empty value renders as 'unset'."""
+    values = {
+        "{{ORCH}}": roles["orchestrator"]["model"],
+        "{{ORCH_P}}": roles["orchestrator"]["provider"],
+        "{{PLAN}}": roles["planner"]["model"],
+        "{{PLAN_P}}": roles["planner"]["provider"],
+        "{{WORK}}": roles["worker"]["model"],
+        "{{WORK_P}}": roles["worker"]["provider"],
+    }
+    for token, value in values.items():
+        template = template.replace(token, value or "unset")
+    return template
+
+
 def _session_source(session_id: str) -> str:
     """sessions.source for this session; '' when unknown (-> fail open)."""
     if not session_id:
@@ -163,20 +307,33 @@ def _session_source(session_id: str) -> str:
     return source
 
 
-def _glm_pass_after(anchor: float, now: float) -> float | None:
-    """started_at of the newest GLM one-shot pass newer than anchor, or None.
+def _unlock_prefixes() -> tuple[str, ...]:
+    """Model prefixes that count as a planning/review pass (from config)."""
+    roles = _roles()
+    models = {roles["planner"]["model"], roles["reviewer"]["model"]}
+    prefixes = {m.split(":", 1)[0].strip() for m in models if m.strip()}
+    if any(m.lower().startswith(LEGACY_UNLOCK_PREFIX) for m in models):
+        # Session rows from before the rename recorded the bare family name.
+        prefixes.add(LEGACY_UNLOCK_PREFIX)
+    return tuple(sorted(prefixes))
+
+
+def _planner_pass_after(anchor: float, now: float) -> float | None:
+    """started_at of the newest planner one-shot pass newer than anchor, or None.
 
     This is the unlock evidence: a recorded run, not a command string. A
     broken lookup returns ``now`` (fail open, logged as an error event): a
     gate that blocks because the session store hiccuped would spend the
-    user's money on GLM passes that can never unlock it.
+    user's money on passes that can never unlock it.
     """
     try:
+        prefixes = _unlock_prefixes() or (LEGACY_UNLOCK_PREFIX,)
+        clause = " or ".join("model like ?" for _ in prefixes)
         rows = _query(
             "select started_at from sessions "
-            "where source = 'oneshot' and model like ? and started_at > ? "
+            f"where source = 'oneshot' and ({clause}) and started_at > ? "
             "order by started_at desc limit 1",
-            (UNLOCK_MODEL_PREFIX + "%", anchor),
+            tuple(p + "%" for p in prefixes) + (anchor,),
         )
         if not rows:
             return None
@@ -256,12 +413,14 @@ def _act_key(action: str) -> str:
 
 def _gate_message(action: str) -> str:
     """Prescribe the spawn; never say 'denied' and never list what is open."""
+    planner = _roles()["planner"]
     job = "review pass" if "review" in action.lower() else "planning pass"
     return (
-        f"DELEGATION GATE: {action.lower()} is a GLM {job}, not work for this model.\n"
+        f"DELEGATION GATE: this is a {job} for the planner, not work for this model.\n"
         f"1) write the brief (facts, the exact question, the output shape) to {BRIEF_PATH}\n"
-        f'2) hermes chat -q "$(cat {BRIEF_PATH})" -m glm-5.3 --provider opencode-go\n'
-        "The GLM reply is that command's stdout. Retry this call once it returns."
+        f'2) hermes chat -q "$(cat {BRIEF_PATH})" -m {planner["model"]} '
+        f'--provider {planner["provider"]}\n'
+        "The reply is that command's stdout. Retry this call once it returns."
     )
 
 
@@ -290,7 +449,7 @@ def _pre_tool_call(tool_name=None, args=None, session_id="", **_kwargs):
         arm_key = (sid, _act_key(action))
         with _ARM_LOCK:
             anchor = _ARMED.get(arm_key, now)
-        evidence = _glm_pass_after(anchor, now)
+        evidence = _planner_pass_after(anchor, now)
         if evidence is not None:
             _gate_event(
                 "allow", session=sid, tool=str(tool_name), action=action,
@@ -310,19 +469,26 @@ def _pre_tool_call(tool_name=None, args=None, session_id="", **_kwargs):
         return None
 
 
-def _policy_text() -> str:
-    """Read and validate the policy; raise with a clear reason on failure."""
-    text = POLICY.read_text(encoding="utf-8").strip()
-    if not text:
+def _policy_text(info=None) -> str:
+    """Read the policy, render this session's role names, validate; raise on failure."""
+    template = POLICY.read_text(encoding="utf-8").strip()
+    if not template:
         raise ValueError("policy.md is empty")
-    if "hermes-plugin-section" in text:
+    if "hermes-plugin-section" in template:
         # Reserved persistence markers make core silently skip the section on
         # every session; refuse at load time where the reason is visible.
         raise ValueError("policy.md contains a reserved hermes-plugin-section marker")
+    missing = [token for token in POLICY_TOKENS if token not in template]
+    if missing:
+        raise ValueError(
+            "policy.md is missing its model token(s): " + ", ".join(missing)
+        )
+    text = _render(template, _roles(info))
     if len(text) > _CEILING:
         raise ValueError(
-            f"policy.md is {len(text)} chars, over the {_CEILING}-char "
-            "system-prompt-section ceiling; trim it"
+            f"policy.md renders to {len(text)} chars, over the {_CEILING}-char "
+            "system-prompt-section ceiling; shorten the configured model names "
+            "or trim policy.md"
         )
     return text
 
@@ -333,7 +499,7 @@ def _section(info) -> str:
     if platform in EXCLUDED_PLATFORMS:
         return ""
     try:
-        return _policy_text()
+        return _policy_text(info)
     except Exception as exc:
         logger.warning("delegation-policy: policy.md unreadable at render: %s", exc)
         return _LOAD_FAILURE_NOTICE
@@ -365,7 +531,7 @@ def _self_test() -> int:
     """Every branch, against the shipped policy and throwaway policy files."""
     import tempfile
 
-    global _session_source, _glm_pass_after, _GATE_EVENTS
+    global _session_source, _planner_pass_after, _GATE_EVENTS
 
     failures: list[str] = []
 
@@ -380,6 +546,69 @@ def _self_test() -> int:
     check("policy is ascii-only", text.isascii(), True)
     check("policy starts with its heading", text.startswith("# Delegation Policy"), True)
     check("policy names the gate", "gate" in text.lower(), True)
+    # Every model string is rendered from config, never left as a token.
+    check("no unrendered token", "{{" in text, False)
+    configured = _roles()["planner"]
+    check(
+        "policy carries the configured planner",
+        configured["model"] in text and configured["provider"] in text,
+        True,
+    )
+
+    # 1b. Role routing: config wins, absent config falls back to the defaults,
+    #     and the worker inherits the orchestrator when delegation.model is unset.
+    global _CONFIG_OVERRIDE
+    saved_config = _CONFIG_OVERRIDE
+    try:
+        _CONFIG_OVERRIDE = {}
+        check("no config -> default planner", _roles()["planner"], DEFAULT_ROLES["planner"])
+        check(
+            "no config -> reviewer follows planner",
+            _roles()["reviewer"],
+            DEFAULT_ROLES["planner"],
+        )
+        _CONFIG_OVERRIDE = {
+            "model": {"default": "orchestrator-x", "provider": "prov-o"},
+            "delegation": {
+                "model": "worker-z",
+                "provider": "prov-w",
+                "roles": {
+                    "planner": {"model": "planner-y", "provider": "prov-p"},
+                    "reviewer": {"model": "reviewer-q", "provider": "prov-r"},
+                },
+            },
+        }
+        roles = _roles({"model": "live-model", "provider": "live-prov"})
+        check("config planner honoured", roles["planner"]["model"], "planner-y")
+        check("config planner provider", roles["planner"]["provider"], "prov-p")
+        check("config reviewer honoured", roles["reviewer"]["model"], "reviewer-q")
+        check("config worker honoured", roles["worker"]["model"], "worker-z")
+        check("live session wins for orchestrator", roles["orchestrator"]["model"], "live-model")
+        check(
+            "no session info -> model.default",
+            _roles()["orchestrator"]["model"],
+            "orchestrator-x",
+        )
+        check("unlock prefixes follow config", _unlock_prefixes(), ("planner-y", "reviewer-q"))
+        rendered = _policy_text()
+        check("rendered uses the configured models", "planner-y" in rendered, True)
+        check("rendered carries the worker", "worker-z" in rendered, True)
+        check("rendered length is honest", len(rendered) <= _CEILING, True)
+        # Absent/unusable config never breaks a render.
+        _CONFIG_OVERRIDE = ["not", "a", "dict"]
+        check("non-dict config -> defaults", _roles()["planner"], DEFAULT_ROLES["planner"])
+        check(
+            "non-dict config still renders",
+            DEFAULT_ROLES["planner"]["model"] in _policy_text(),
+            True,
+        )
+    finally:
+        _CONFIG_OVERRIDE = saved_config
+    check(
+        "glm planner accepts the legacy family prefix",
+        LEGACY_UNLOCK_PREFIX in _unlock_prefixes(),
+        DEFAULT_ROLES["planner"]["model"].startswith(LEGACY_UNLOCK_PREFIX),
+    )
 
     # 2. Platform gate: workers and cron are excluded, main surfaces served.
     check("subagent excluded", _section({"platform": "subagent"}), "")
@@ -547,22 +776,23 @@ def _self_test() -> int:
     )
 
     # 6. Gate outcome: block / allow / exempt, with the lookups stubbed.
-    saved_source, saved_evidence = _session_source, _glm_pass_after
+    saved_source, saved_evidence = _session_source, _planner_pass_after
     try:
         _ARMED.clear()
         _SOURCE_CACHE.clear()
         _GATE_EVENTS = False
 
         _session_source = lambda session_id: "local"
-        _glm_pass_after = lambda anchor, now: None
+        _planner_pass_after = lambda anchor, now: None
         blocked = _pre_tool_call(
             tool_name="skill_view", args={"name": "plan"}, session_id="s1"
         )
         check("orchestrator blocked", isinstance(blocked, dict), True)
         check("block action", (blocked or {}).get("action"), "block")
+        planner = _roles()["planner"]
         check(
-            "block message prescribes the command",
-            "-m glm-5.3 --provider opencode-go"
+            "block message prescribes the configured command",
+            f'-m {planner["model"]} --provider {planner["provider"]}'
             in str((blocked or {}).get("message", "")),
             True,
         )
@@ -583,7 +813,7 @@ def _self_test() -> int:
                 return now
             return None
 
-        _glm_pass_after = _stub_evidence
+        _planner_pass_after = _stub_evidence
         evidence["pass"] = True
         check(
             "fresh glm pass allows",
@@ -613,7 +843,7 @@ def _self_test() -> int:
             ),
             None,
         )
-        # ... but a stale one does not (the TTL branch inside _glm_pass_after).
+        # ... but a stale one does not (the TTL branch inside _planner_pass_after).
         check(
             "stale glm pass blocks again",
             isinstance(
@@ -641,7 +871,7 @@ def _self_test() -> int:
             globals()["_hermes_home"] = lambda: Path(_tmp)
             try:
                 (Path(_tmp) / "state.db").write_text("not a database", encoding="utf-8")
-                _glm_pass_after = real_evidence
+                _planner_pass_after = real_evidence
                 check(
                     "broken state.db fails open",
                     _pre_tool_call(
@@ -653,7 +883,7 @@ def _self_test() -> int:
                 def _boom(anchor, now):
                     raise RuntimeError("db gone")
 
-                _glm_pass_after = _boom
+                _planner_pass_after = _boom
                 _ARMED.clear()
                 check(
                     "raising lookup fails open",
@@ -693,7 +923,7 @@ def _self_test() -> int:
             None,
         )
     finally:
-        _session_source, _glm_pass_after = saved_source, saved_evidence
+        _session_source, _planner_pass_after = saved_source, saved_evidence
         _GATE_EVENTS = True
         _ARMED.clear()
         _SOURCE_CACHE.clear()
